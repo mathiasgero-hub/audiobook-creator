@@ -807,8 +807,18 @@
         <div class="file-name" id="book-file-name"></div>
       </div>
       <input type="file" id="book-file-input" accept=".pdf,.txt,.epub,.md,.text,.jpg,.jpeg,.png,.webp,.bmp,.tiff,.tif,image/*" multiple style="display:none">
-      <input type="file" id="book-camera-input" accept="image/*" capture="environment" multiple style="display:none">
-      <button id="camera-btn" class="camera-btn" style="display:none;width:100%;margin-top:8px;background:var(--surface2);border:1.5px dashed var(--accent);border-radius:10px;padding:11px;font-size:14px;font-weight:600;color:var(--accent);cursor:pointer">📷 Prendre des photos avec l'appareil</button>
+      <input type="file" id="book-camera-input" accept="image/*" capture="environment" style="display:none">
+      <!-- Camera zone (mobile) -->
+      <div id="camera-zone" style="display:none;margin-top:8px">
+        <button id="camera-btn" class="camera-btn" style="width:100%;background:var(--surface2);border:1.5px dashed var(--accent);border-radius:10px;padding:11px;font-size:14px;font-weight:600;color:var(--accent);cursor:pointer">📷 Prendre une photo</button>
+        <div id="camera-strip" style="display:none;margin-top:10px">
+          <div id="camera-thumbs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"></div>
+          <div style="display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--text-muted)">
+            <span id="camera-count">0 photo(s)</span>
+            <button id="camera-clear-btn" style="font-size:11px;color:var(--text-muted);background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:3px 8px;cursor:pointer">✕ Effacer tout</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="form-group">
@@ -1641,6 +1651,7 @@ let _segPaused   = false;
 let _segResumeFn = null;
 let _segTimers   = [];
 let _segOnDone   = null;
+let _ttsKeepaliveId = null; // iOS/Android TTS keepalive
 
 function _clearSegTimers() {
   _segTimers.forEach(clearTimeout);
@@ -1668,29 +1679,60 @@ function playSegments(segments, voice, rate, onDone) {
     u.rate    = rate  || 1;
     u.pitch   = 1; u.volume = 1;
 
-    u.onend = () => {
-      if (_segPaused) { _segResumeFn = next; return; }
-      if (seg.pauseAfter > 0) {
-        const t = setTimeout(next, seg.pauseAfter);
-        _segTimers.push(t);
-      } else { next(); }
+    // Guard: onend/onerror fire only once
+    let fired = false;
+    const advance = () => {
+      if (seg.pauseAfter > 0) { const t = setTimeout(next, seg.pauseAfter); _segTimers.push(t); }
+      else next();
     };
-    u.onstart = () => { console.log('[TTS] started:', seg.text.slice(0, 40)); };
+
+    // Watchdog: iOS/Android sometimes silently drop onend
+    // Estimate duration based on text length and rate, add 3s buffer
+    const charsPerSec = 12 * (rate || 1);
+    const watchdogMs = Math.min(60000, Math.max(4000, (seg.text.length / charsPerSec) * 1000 + 3000));
+    const watchdog = setTimeout(() => {
+      if (!fired) { fired = true; console.warn('[TTS] watchdog — onend missing, advancing'); advance(); }
+    }, watchdogMs);
+    _segTimers.push(watchdog);
+
+    u.onend = () => {
+      if (fired) return; fired = true;
+      clearTimeout(watchdog);
+      if (_segPaused) { _segResumeFn = next; return; }
+      advance();
+    };
     u.onerror = e => {
-      console.error('[TTS] error:', e.error, e);
+      if (fired) return; fired = true;
+      clearTimeout(watchdog);
+      console.warn('[TTS] onerror:', e.error);
       if (e.error !== 'interrupted') next();
     };
-    console.log('[TTS] speak() —', JSON.stringify(seg.text.slice(0, 40)), '| voices avail:', speechSynthesis.getVoices().length);
     if (speechSynthesis.paused) speechSynthesis.resume();
     speechSynthesis.speak(u);
   }
   next();
 }
 
+function _startTTSKeepalive() {
+  if (_ttsKeepaliveId) return;
+  // iOS/Android: speech synthesis silently stops after ~15s. pause+resume keeps it alive.
+  _ttsKeepaliveId = setInterval(() => {
+    if (state.isPlaying && typeof speechSynthesis !== 'undefined'
+        && speechSynthesis.speaking && !speechSynthesis.paused) {
+      speechSynthesis.pause();
+      speechSynthesis.resume();
+    }
+  }, 8000);
+}
+function _stopTTSKeepalive() {
+  if (_ttsKeepaliveId) { clearInterval(_ttsKeepaliveId); _ttsKeepaliveId = null; }
+}
+
 function stopAll() {
   _segPaused   = false;
   _segResumeFn = null;
   _clearSegTimers();
+  _stopTTSKeepalive();
   speechSynthesis.cancel();
 }
 
@@ -2065,6 +2107,7 @@ function togglePlay() {
   console.log('[TTS] togglePlay — voices:', speechSynthesis.getVoices().length, '| paused:', speechSynthesis.paused, '| speaking:', speechSynthesis.speaking);
   // Call speakCurrent() directly (synchronous) to stay within the user-gesture context
   // required by Edge/Chrome for speechSynthesis.speak() — setTimeout would break it
+  _startTTSKeepalive();
   try {
     speakCurrent();
   } catch(e) {
@@ -2126,8 +2169,12 @@ function resetAddForm() {
   state.bookFile = null;
   state.bookFiles = null;
   state.coverFile = null;
+  state.cameraPhotos = [];
+  if ($('camera-strip')) $('camera-strip').style.display = 'none';
+  if ($('camera-btn')) $('camera-btn').textContent = '📷 Prendre une photo';
+  if ($('book-camera-input')) $('book-camera-input').value = '';
   state.coverMode = 'upload';
-  setCoverMode('auto');
+  setCoverMode('upload');
 }
 
 function setCoverMode(mode) {
@@ -2425,20 +2472,64 @@ async function init() {
   });
 
 
-  // ── Camera button (mobile only) ──
+  // ── Camera button (mobile only) — accumulates photos in capture order ──
   const isMobile = navigator.maxTouchPoints > 0 || /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-  if (isMobile) {
-    $('camera-btn').style.display = 'block';
+  if (isMobile) $('camera-zone').style.display = 'block';
+
+  // cameraPhotos: File[] accumulated across multiple captures
+  state.cameraPhotos = [];
+
+  function updateCameraUI() {
+    const n = state.cameraPhotos.length;
+    const strip = $('camera-strip');
+    const thumbs = $('camera-thumbs');
+    const btn = $('camera-btn');
+    $('camera-count').textContent = n + ' photo(s)';
+    btn.textContent = n === 0 ? '📷 Prendre une photo' : `📷 Ajouter une photo (${n} prise${n>1?'s':''})`;
+    strip.style.display = n > 0 ? 'block' : 'none';
+
+    // Rebuild thumbnails
+    thumbs.innerHTML = '';
+    state.cameraPhotos.forEach((f, i) => {
+      const url = URL.createObjectURL(f);
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'position:relative;width:52px;height:52px;flex-shrink:0';
+      const img = document.createElement('img');
+      img.src = url; img.style.cssText = 'width:52px;height:52px;object-fit:cover;border-radius:6px;border:2px solid var(--primary)';
+      img.onload = () => URL.revokeObjectURL(url);
+      const num = document.createElement('span');
+      num.textContent = i + 1;
+      num.style.cssText = 'position:absolute;top:2px;left:4px;font-size:10px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000';
+      wrap.appendChild(img); wrap.appendChild(num);
+      thumbs.appendChild(wrap);
+    });
+
+    // Update bookFiles from cameraPhotos
+    if (n > 0) {
+      setBookFile(state.cameraPhotos[0], state.cameraPhotos);
+    }
   }
+
   $('camera-btn').addEventListener('click', e => {
     e.preventDefault();
+    $('book-camera-input').value = ''; // reset so same file can be re-selected
     $('book-camera-input').click();
   });
+
   $('book-camera-input').addEventListener('change', e => {
     const files = [...e.target.files];
     if (files.length === 0) return;
-    const sorted = files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-    setBookFile(sorted[0], sorted);
+    // Append in capture order (timestamp order if available, else push as-is)
+    files.forEach(f => state.cameraPhotos.push(f));
+    updateCameraUI();
+  });
+
+  $('camera-clear-btn').addEventListener('click', () => {
+    state.cameraPhotos = [];
+    $('book-camera-input').value = '';
+    updateCameraUI();
+    $('book-file-name').textContent = '';
+    state.bookFile = null; state.bookFiles = null;
   });
 
   $('add-book-submit').addEventListener('click', submitAddBook);
