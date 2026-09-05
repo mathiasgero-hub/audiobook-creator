@@ -3211,6 +3211,26 @@ window.initKokoro = async function() {
   window._kokoroLoading = true;
   showToast('🤖 Téléchargement de Kokoro IA (~300 MB)… Cela prend quelques minutes la première fois.', 'info');
   try {
+    // Patch fetch pour router HuggingFace via le process Electron (contourne file:// CORS)
+    const _nativeFetch = window.fetch.bind(window);
+    window.fetch = async function(input, init) {
+      const url = typeof input === 'string' ? input : input?.url || String(input);
+      const needsProxy = url.includes('huggingface.co') || url.includes('cdn-lfs') ||
+                         url.includes('hf.co');
+      if (needsProxy && window.electronAPI?.proxyFetch) {
+        const r = await window.electronAPI.proxyFetch(url, {
+          method:  (init?.method)  || 'GET',
+          headers: (init?.headers) || {},
+        });
+        if (!r.ok && r.error) throw new Error(r.error);
+        const bytes  = atob(r.data);
+        const buf    = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i);
+        return new Response(buf, { status: r.status, headers: r.headers });
+      }
+      return _nativeFetch(input, init);
+    };
+
     const { KokoroTTS } = await import('https://esm.sh/kokoro-js@1');
     window._kokoroTTS = await KokoroTTS.from_pretrained(
       'onnx-community/Kokoro-82M-v1.0',
