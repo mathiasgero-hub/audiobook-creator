@@ -3212,9 +3212,8 @@ window.initKokoro = async function() {
   showToast('🤖 Téléchargement de Kokoro IA (~300 MB)… Cela prend quelques minutes la première fois.', 'info');
   try {
     const { KokoroTTS } = await import('https://esm.sh/kokoro-js@1');
-    // Passer l'URL complète évite que transformers.js détecte le model ID comme un chemin local
     window._kokoroTTS = await KokoroTTS.from_pretrained(
-      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0',
+      'onnx-community/Kokoro-82M-v1.0',
       {
         dtype: 'q8',
         progress_callback: p => {
