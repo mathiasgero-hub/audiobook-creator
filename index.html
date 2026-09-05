@@ -3216,9 +3216,10 @@ window.initKokoro = async function() {
       'https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/dist/kokoro.web.js'
     );
     window._kokoroTTS = await KokoroTTS.from_pretrained(
-      'onnx-community/Kokoro-82M-v1.0',
+      'onnx-community/Kokoro-82M-v1.0-ONNX',
       {
         dtype: 'q8',
+        device: 'wasm',
         progress_callback: p => {
           if (p.status === 'progress') {
             const pct = Math.round(p.progress || 0);
