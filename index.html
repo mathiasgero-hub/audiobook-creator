@@ -1733,6 +1733,7 @@ function stopAll() {
   _segResumeFn = null;
   _clearSegTimers();
   _stopTTSKeepalive();
+  stopKokoro();
   speechSynthesis.cancel();
 }
 
@@ -1752,6 +1753,64 @@ class TTSPlayer {
   get isSpeaking() { return speechSynthesis.speaking; }
 }
 
+// ===================== KOKORO TTS ENGINE ===========
+let _kokoroAudioCtx  = null;
+let _kokoroSource    = null;
+let _kokoroCancelled = false;
+
+function _getAudioCtx() {
+  if (!_kokoroAudioCtx || _kokoroAudioCtx.state === 'closed') {
+    _kokoroAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return _kokoroAudioCtx;
+}
+
+async function playSegmentsKokoro(segments, voiceId, rate, onDone) {
+  _clearSegTimers();
+  _kokoroCancelled = false;
+
+  for (let i = 0; i < segments.length; i++) {
+    if (_kokoroCancelled) return;
+    if (_segPaused) {
+      // attend que resume() appelle _segResumeFn
+      await new Promise(resolve => { _segResumeFn = resolve; });
+    }
+    if (_kokoroCancelled) return;
+
+    const seg = segments[i];
+    try {
+      const result = await window._kokoroTTS.generate(seg.text, {
+        voice: voiceId || 'ff_siwis',
+        speed: Math.max(0.5, Math.min(2, rate || 1))
+      });
+      if (_kokoroCancelled) return;
+
+      const ctx = _getAudioCtx();
+      if (ctx.state === 'suspended') await ctx.resume();
+      const buf = ctx.createBuffer(1, result.audio.length, result.sampling_rate);
+      buf.copyToChannel(result.audio, 0);
+      _kokoroSource = ctx.createBufferSource();
+      _kokoroSource.buffer = buf;
+      _kokoroSource.connect(ctx.destination);
+
+      await new Promise(resolve => { _kokoroSource.onended = resolve; _kokoroSource.start(); });
+      _kokoroSource = null;
+
+      if (seg.pauseAfter > 0 && !_kokoroCancelled) {
+        await new Promise(r => { const t = setTimeout(r, seg.pauseAfter); _segTimers.push(t); });
+      }
+    } catch(e) {
+      console.warn('[Kokoro] segment error:', e);
+    }
+  }
+  if (!_kokoroCancelled) onDone && onDone();
+}
+
+function stopKokoro() {
+  _kokoroCancelled = true;
+  if (_kokoroSource) { try { _kokoroSource.stop(); } catch(e) {} _kokoroSource = null; }
+}
+
 // ===================== APP STATE ===================
 const db = new BookDB();
 const tts = new TTSPlayer();
@@ -1765,6 +1824,8 @@ let state = {
   speed: 1.0,
   selectedVoice: null,
   voices: [],
+  ttsEngine: 'browser',   // 'browser' | 'kokoro'
+  kokoroVoice: 'ff_siwis', // voix Kokoro par défaut (français)
   fontSize: 17,
   repeatPrev: true,
   apiKey: '',
@@ -2043,17 +2104,11 @@ function speakCurrent() {
     state.isPlaying = false; updatePlayerUI();
     showToast('📚 Lecture terminée !'); return;
   }
-  // Fallback: use any available voice if none selected
-  if (!state.selectedVoice) {
-    const voices = speechSynthesis.getVoices();
-    const fr = voices.filter(v => v.lang.startsWith('fr'));
-    state.selectedVoice = fr[0] || voices[0] || null;
-  }
   const segments = textToSegments(
     state.sentences[state.currentIdx],
     state.commaPauseMs ?? 250
   );
-  playSegments(segments, state.selectedVoice, state.speed, () => {
+  const onDone = () => {
     if (!state.isPlaying) return;
     state.currentIdx++;
     highlightCurrent(); updatePlayerUI(); saveProgress();
@@ -2065,7 +2120,28 @@ function speakCurrent() {
       state.isPlaying = false; updatePlayerUI();
       showToast('📚 Lecture terminée !');
     }
-  });
+  };
+
+  if (state.ttsEngine === 'kokoro') {
+    if (!window._kokoroTTS) {
+      // Kokoro pas encore chargé — on attend
+      window.initKokoro().then(ok => {
+        if (ok && state.isPlaying) speakCurrent();
+        else { state.isPlaying = false; updatePlayerUI(); }
+      });
+      return;
+    }
+    playSegmentsKokoro(segments, state.kokoroVoice, state.speed, onDone);
+    return;
+  }
+
+  // Moteur navigateur (Web Speech API)
+  if (!state.selectedVoice) {
+    const voices = speechSynthesis.getVoices();
+    const fr = voices.filter(v => v.lang.startsWith('fr'));
+    state.selectedVoice = fr[0] || voices[0] || null;
+  }
+  playSegments(segments, state.selectedVoice, state.speed, onDone);
 }
 
 function togglePlay() {
@@ -2148,6 +2224,12 @@ async function loadSettings() {
 
   const voiceName = await db.getSetting('voiceName');
   if (voiceName) selectVoiceByName(voiceName);
+
+  const engine = await db.getSetting('ttsEngine');
+  if (engine === 'kokoro') {
+    state.ttsEngine = 'kokoro';
+    $('voice-chip-label').textContent = 'Kokoro IA';
+  }
 }
 
 function updateToggle(id, on) {
@@ -2329,18 +2411,37 @@ function openVoicePicker() {
   const fr = voices.filter(v => v.lang.startsWith('fr'));
   const other = voices.filter(v => !v.lang.startsWith('fr'));
 
-  let html = '';
-  if (fr.length > 0) {
-    html += '<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">Voix françaises</div>';
-    html += fr.map(v => voiceItem(v)).join('');
-  }
+  const kokoroActive = state.ttsEngine === 'kokoro';
+  let html = `<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">🤖 Voix IA — Kokoro (locale, gratuite)</div>
+<div class="context-item voice-pick-item ${kokoroActive ? 'active' : ''}" data-engine="kokoro" style="${kokoroActive ? 'color:var(--primary);font-weight:600' : ''}">
+  ${kokoroActive ? '✓ ' : ''}🇫🇷 Siwis — Français naturel <span style="color:var(--text-muted);font-size:12px">(~300MB, téléchargé une fois)</span>
+</div>
+<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-top:8px">🔊 Voix système (navigateur)</div>`;
+
+  if (fr.length > 0) html += fr.map(v => voiceItem(v)).join('');
   if (other.length > 0) {
     html += '<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-top:8px">Autres voix</div>';
     html += other.slice(0, 20).map(v => voiceItem(v)).join('');
   }
   list.innerHTML = html || '<div style="padding:16px;color:var(--text-muted);font-size:14px">Aucune voix disponible</div>';
-  list.querySelectorAll('.voice-pick-item').forEach(el => {
+
+  // Kokoro item click
+  list.querySelectorAll('[data-engine="kokoro"]').forEach(el => {
+    el.addEventListener('click', async () => {
+      state.ttsEngine = 'kokoro';
+      db.setSetting('ttsEngine', 'kokoro');
+      closeModal('voice-modal');
+      $('voice-chip-label').textContent = 'Kokoro IA';
+      showToast('🤖 Kokoro sélectionné');
+      if (!window._kokoroTTS && !window._kokoroLoading) window.initKokoro();
+    });
+  });
+
+  // Voix système click
+  list.querySelectorAll('.voice-pick-item:not([data-engine])').forEach(el => {
     el.addEventListener('click', () => {
+      state.ttsEngine = 'browser';
+      db.setSetting('ttsEngine', 'browser');
       selectVoiceByName(el.dataset.name);
       db.setSetting('voiceName', el.dataset.name);
       closeModal('voice-modal');
@@ -3098,6 +3199,46 @@ init().then(()=>initOCRReview()).catch(console.error);
     </div>
   </div>
 </div>
+
+<!-- ===== KOKORO TTS — moteur IA local ===== -->
+<script type="module">
+window._kokoroTTS     = null;
+window._kokoroLoading = false;
+
+window.initKokoro = async function() {
+  if (window._kokoroTTS)     return true;
+  if (window._kokoroLoading) return false;
+  window._kokoroLoading = true;
+  showToast('🤖 Téléchargement de Kokoro IA (~300 MB)… Cela prend quelques minutes la première fois.', 'info');
+  try {
+    const { KokoroTTS } = await import(
+      'https://cdn.jsdelivr.net/npm/kokoro-js@1/dist/kokoro.js'
+    );
+    window._kokoroTTS = await KokoroTTS.from_pretrained(
+      'onnx-community/Kokoro-82M-v1.0',
+      {
+        dtype: 'q8',
+        progress_callback: p => {
+          if (p.status === 'progress') {
+            const pct = Math.round(p.progress || 0);
+            document.title = `Kokoro ${pct}% — AudioBook Creator`;
+          } else if (p.status === 'done') {
+            document.title = 'AudioBook Creator';
+          }
+        }
+      }
+    );
+    window._kokoroLoading = false;
+    showToast('✅ Kokoro IA prêt ! Qualité voix naturelle activée.');
+    return true;
+  } catch(e) {
+    window._kokoroLoading = false;
+    console.error('[Kokoro] init error:', e);
+    showToast('❌ Kokoro indisponible : ' + e.message, 'error');
+    return false;
+  }
+};
+</script>
 
 </body>
 </html>
