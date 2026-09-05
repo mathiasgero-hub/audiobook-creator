@@ -1781,19 +1781,25 @@ async function playSegmentsKokoro(segments, voiceId, rate, onDone) {
     try {
       const result = await window._kokoroTTS.generate(seg.text, {
         voice: voiceId || 'ff_siwis',
-        speed: Math.max(0.5, Math.min(2, rate || 1))
       });
       if (_kokoroCancelled) return;
 
+      // result est un objet RawAudio : { audio: Float32Array, sampling_rate: number }
+      const audioData   = result.audio instanceof Float32Array ? result.audio : new Float32Array(result.audio);
+      const sampleRate  = result.sampling_rate || 24000;
+
       const ctx = _getAudioCtx();
       if (ctx.state === 'suspended') await ctx.resume();
-      const buf = ctx.createBuffer(1, result.audio.length, result.sampling_rate);
-      buf.copyToChannel(result.audio, 0);
+      const buf = ctx.createBuffer(1, audioData.length, sampleRate);
+      buf.copyToChannel(audioData, 0);
       _kokoroSource = ctx.createBufferSource();
       _kokoroSource.buffer = buf;
       _kokoroSource.connect(ctx.destination);
 
-      await new Promise(resolve => { _kokoroSource.onended = resolve; _kokoroSource.start(); });
+      await new Promise(resolve => {
+        _kokoroSource.onended = resolve;
+        _kokoroSource.start();
+      });
       _kokoroSource = null;
 
       if (seg.pauseAfter > 0 && !_kokoroCancelled) {
@@ -1801,6 +1807,7 @@ async function playSegmentsKokoro(segments, voiceId, rate, onDone) {
       }
     } catch(e) {
       console.warn('[Kokoro] segment error:', e);
+      showToast('⚠️ Kokoro erreur segment : ' + e.message, 'error');
     }
   }
   if (!_kokoroCancelled) onDone && onDone();
