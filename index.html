@@ -3211,22 +3211,10 @@ window.initKokoro = async function() {
   window._kokoroLoading = true;
   showToast('🤖 Téléchargement de Kokoro IA (~300 MB)… Cela prend quelques minutes la première fois.', 'info');
   try {
-    // Masquer process.versions.node pour que transformers.js se croie dans un vrai navigateur
-    // (Electron expose process même avec contextIsolation, ce qui déclenche le blocage remote)
-    try {
-      if (typeof process !== 'undefined' && process.versions) {
-        delete process.versions.node;
-        delete process.versions.electron;
-      }
-    } catch(_) {}
-
-    const kokoro = await import('https://esm.sh/kokoro-js@1');
-    // Si kokoro-js ré-exporte env de transformers, l'activer explicitement
-    if (kokoro.env) {
-      kokoro.env.allowRemoteModels = true;
-      kokoro.env.allowLocalModels  = true;
-    }
-    const KokoroTTS = kokoro.KokoroTTS;
+    // Utiliser le build navigateur de kokoro-js (pas le build Node.js qui bloque les modèles distants)
+    const { KokoroTTS } = await import(
+      'https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/dist/kokoro.web.js'
+    );
     window._kokoroTTS = await KokoroTTS.from_pretrained(
       'onnx-community/Kokoro-82M-v1.0',
       {
