@@ -68,5 +68,8 @@
       ],
       "category": "Education"
     }
+  },
+  "dependencies": {
+    "msedge-tts": "^2.0.7"
   }
 }

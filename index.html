@@ -591,6 +591,21 @@
     .ocr-retry-btn.retrying { color: var(--accent); border-color: var(--accent); }
     .ocr-select-col { display: flex; flex-direction: column; align-items: center; gap: 6px; padding-top: 4px; }
     .ocr-checkbox { width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; }
+    .ocr-move-btn {
+      width: 26px; height: 26px; border-radius: 6px; border: 1.5px solid var(--border);
+      background: var(--surface2); color: var(--text-muted); font-size: 14px;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      transition: border-color .15s, color .15s; padding: 0; line-height: 1;
+    }
+    .ocr-move-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+    .ocr-move-btn:disabled { opacity: 0.25; cursor: default; }
+    .ocr-delete-btn {
+      width: 26px; height: 26px; border-radius: 6px; border: 1.5px solid var(--border);
+      background: var(--surface2); color: #FF3C3C; font-size: 14px;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      transition: border-color .15s, background .15s; padding: 0; line-height: 1;
+    }
+    .ocr-delete-btn:hover { border-color: #FF3C3C; background: rgba(255,60,60,.1); }
     .ocr-global-bar {
       display: flex; gap: 8px; align-items: center;
       padding: 10px 0; border-bottom: 1px solid var(--border); margin-bottom: 10px;
@@ -1758,6 +1773,20 @@ let _kokoroAudioCtx  = null;
 let _kokoroSource    = null;
 let _kokoroCancelled = false;
 
+// ---- Edge TTS : génération audio via IPC Electron ----
+
+async function _kokoroGenAudio(text, _isMMS, voiceId) {
+  // Valider l'ID : les voix Edge TTS contiennent toujours '-Neural'
+  const voice  = (voiceId && voiceId.includes('-Neural')) ? voiceId : 'fr-FR-DeniseNeural';
+  const result = await window.electronAPI.ttsGenerate(text, voice);
+  if (result.error) throw new Error(result.error);
+  // Décoder le MP3 via Web Audio API
+  const bytes  = Uint8Array.from(atob(result.mp3b64), c => c.charCodeAt(0));
+  const ctx    = _getAudioCtx();
+  const abuf   = await ctx.decodeAudioData(bytes.buffer.slice(0));
+  return { audioData: abuf.getChannelData(0), sampleRate: abuf.sampleRate };
+}
+
 function _getAudioCtx() {
   if (!_kokoroAudioCtx || _kokoroAudioCtx.state === 'closed') {
     _kokoroAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1765,56 +1794,99 @@ function _getAudioCtx() {
   return _kokoroAudioCtx;
 }
 
+// ---- Cache audio & génération ----
+const _kokoroCache = new Map();  // clé → { audioData, sampleRate }
+let   _kokoroGenId = 0;          // ID de génération pour détecter les appels périmés
+
+// (ancienne fonction ONNX supprimée — remplacée par Edge TTS ci-dessus)
+
+// Pré-génère en arrière-plan la phrase suivante pendant la lecture
+function kokoroPregenerateNext(nextSentence, voiceId) {
+  if (!nextSentence || !window.electronAPI?.ttsGenerate) return;
+  const key = (voiceId || 'fr') + '|' + nextSentence;
+  if (_kokoroCache.has(key)) return;
+  const gid = _kokoroGenId;
+  _kokoroGenAudio(nextSentence, false, voiceId)
+    .then(r => { if (_kokoroGenId === gid) _kokoroCache.set(key, r); })
+    .catch(() => {});
+}
+
 async function playSegmentsKokoro(segments, voiceId, rate, onDone) {
+  // Annuler toute boucle précédente via l'ID de génération
+  _kokoroCancelled = true;
+  if (_kokoroSource) { try { _kokoroSource.stop(); } catch(e) {} _kokoroSource = null; }
+  const myId = ++_kokoroGenId;
+  await new Promise(r => setTimeout(r, 0)); // laisser l'ancienne boucle voir _kokoroCancelled
+  if (myId !== _kokoroGenId) return;
+
   _clearSegTimers();
   _kokoroCancelled = false;
+  if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
 
   for (let i = 0; i < segments.length; i++) {
-    if (_kokoroCancelled) return;
+    if (_kokoroCancelled || myId !== _kokoroGenId) return;
     if (_segPaused) {
-      // attend que resume() appelle _segResumeFn
       await new Promise(resolve => { _segResumeFn = resolve; });
     }
-    if (_kokoroCancelled) return;
+    if (_kokoroCancelled || myId !== _kokoroGenId) return;
 
     const seg = segments[i];
+    const cacheKey = (voiceId || 'fr') + '|' + seg.text;
+
+    let audioData, sampleRate;
     try {
-      const result = await window._kokoroTTS.generate(seg.text, {
-        voice: voiceId || 'ff_siwis',
-      });
-      if (_kokoroCancelled) return;
-
-      // result est un objet RawAudio : { audio: Float32Array, sampling_rate: number }
-      const audioData   = result.audio instanceof Float32Array ? result.audio : new Float32Array(result.audio);
-      const sampleRate  = result.sampling_rate || 24000;
-
-      const ctx = _getAudioCtx();
-      if (ctx.state === 'suspended') await ctx.resume();
-      const buf = ctx.createBuffer(1, audioData.length, sampleRate);
-      buf.copyToChannel(audioData, 0);
-      _kokoroSource = ctx.createBufferSource();
-      _kokoroSource.buffer = buf;
-      _kokoroSource.connect(ctx.destination);
-
-      await new Promise(resolve => {
-        _kokoroSource.onended = resolve;
-        _kokoroSource.start();
-      });
-      _kokoroSource = null;
-
-      if (seg.pauseAfter > 0 && !_kokoroCancelled) {
-        await new Promise(r => { const t = setTimeout(r, seg.pauseAfter); _segTimers.push(t); });
+      if (_kokoroCache.has(cacheKey)) {
+        ({ audioData, sampleRate } = _kokoroCache.get(cacheKey));
+        _kokoroCache.delete(cacheKey);
+      } else {
+        ({ audioData, sampleRate } = await _kokoroGenAudio(seg.text, false, voiceId));
       }
     } catch(e) {
-      console.warn('[Kokoro] segment error:', e);
-      showToast('⚠️ Kokoro erreur segment : ' + e.message, 'error');
+      if (_kokoroCancelled || myId !== _kokoroGenId) return;
+      console.error('[TTS IA] segment error:', e.message || e);
+      showToast('❌ TTS erreur : ' + (e.message || e), 'error');
+      state.isPlaying = false; updatePlayerUI();
+      return; // arrêt complet — ne pas avancer silencieusement
+    }
+    if (_kokoroCancelled || myId !== _kokoroGenId) return;
+
+    // Pré-générer le segment suivant pendant que celui-ci se lit
+    const nextSeg = segments[i + 1];
+    if (nextSeg) {
+      const nextKey = (voiceId || 'fr') + '|' + nextSeg.text;
+      if (!_kokoroCache.has(nextKey)) {
+        const gid = myId;
+        _kokoroGenAudio(nextSeg.text, false, voiceId)
+          .then(r => { if (_kokoroGenId === gid) _kokoroCache.set(nextKey, r); })
+          .catch(() => {});
+      }
+    }
+
+    const ctx = _getAudioCtx();
+    if (ctx.state === 'suspended') await ctx.resume();
+    const buf = ctx.createBuffer(1, audioData.length, sampleRate);
+    buf.copyToChannel(audioData, 0);
+    _kokoroSource = ctx.createBufferSource();
+    _kokoroSource.buffer = buf;
+    _kokoroSource.connect(ctx.destination);
+
+    await new Promise(resolve => {
+      _kokoroSource.onended = resolve;
+      _kokoroSource.start();
+    });
+    _kokoroSource = null;
+
+    if (seg.pauseAfter > 0 && !_kokoroCancelled && myId === _kokoroGenId) {
+      await new Promise(r => { const t = setTimeout(r, seg.pauseAfter); _segTimers.push(t); });
     }
   }
-  if (!_kokoroCancelled) onDone && onDone();
+  if (!_kokoroCancelled && myId === _kokoroGenId) onDone && onDone();
 }
 
 function stopKokoro() {
   _kokoroCancelled = true;
+  _kokoroGenId++;
+  _kokoroCache.clear();
   if (_kokoroSource) { try { _kokoroSource.stop(); } catch(e) {} _kokoroSource = null; }
 }
 
@@ -1831,8 +1903,8 @@ let state = {
   speed: 1.0,
   selectedVoice: null,
   voices: [],
-  ttsEngine: 'browser',   // 'browser' | 'kokoro'
-  kokoroVoice: 'ff_siwis', // voix Kokoro par défaut (français)
+  ttsEngine: 'kokoro',    // 'kokoro' uniquement (voix IA)
+  kokoroVoice: 'mms',   // 'mms' = français | 'af_heart' | 'bf_emma' | 'am_adam' | 'bm_george' …
   fontSize: 17,
   repeatPrev: true,
   apiKey: '',
@@ -2111,44 +2183,34 @@ function speakCurrent() {
     state.isPlaying = false; updatePlayerUI();
     showToast('📚 Lecture terminée !'); return;
   }
-  const segments = textToSegments(
-    state.sentences[state.currentIdx],
-    state.commaPauseMs ?? 250
-  );
-  const onDone = () => {
-    if (!state.isPlaying) return;
-    state.currentIdx++;
-    highlightCurrent(); updatePlayerUI(); saveProgress();
-    const pause = state.sentencePauseMs ?? 500;
-    if (state.currentIdx < state.sentences.length) {
-      const t = setTimeout(speakCurrent, pause);
-      _segTimers.push(t);
-    } else {
-      state.isPlaying = false; updatePlayerUI();
-      showToast('📚 Lecture terminée !');
-    }
-  };
-
   if (state.ttsEngine === 'kokoro') {
-    if (!window._kokoroTTS) {
-      // Kokoro pas encore chargé — on attend
-      window.initKokoro().then(ok => {
-        if (ok && state.isPlaying) speakCurrent();
-        else { state.isPlaying = false; updatePlayerUI(); }
-      });
+    if (!window.electronAPI?.ttsGenerate) {
+      showToast('❌ API TTS non disponible — vérifiez la connexion internet', 'error');
+      state.isPlaying = false; updatePlayerUI();
       return;
     }
-    playSegmentsKokoro(segments, state.kokoroVoice, state.speed, onDone);
+    const rawText    = state.sentences[state.currentIdx];
+    const aiSegments = [{ text: rawText, pauseAfter: 0 }];
+    const sentPause  = state.sentencePauseMs ?? 150;
+    const aiOnDone = () => {
+      if (!state.isPlaying) return;
+      state.currentIdx++;
+      highlightCurrent(); updatePlayerUI(); saveProgress();
+      if (state.currentIdx < state.sentences.length) {
+        const t = setTimeout(speakCurrent, sentPause);
+        _segTimers.push(t);
+      } else {
+        state.isPlaying = false; updatePlayerUI();
+        showToast('📚 Lecture terminée !');
+      }
+    };
+    playSegmentsKokoro(aiSegments, state.kokoroVoice, state.speed, aiOnDone);
+
+    // Pré-générer le premier chunk de la phrase suivante pendant la lecture
+    const nextSentence = state.sentences[state.currentIdx + 1];
+    kokoroPregenerateNext(nextSentence, state.kokoroVoice);
     return;
   }
-
-  // Moteur navigateur (Web Speech API)
-  if (!state.selectedVoice) {
-    const voices = speechSynthesis.getVoices();
-    const fr = voices.filter(v => v.lang.startsWith('fr'));
-    state.selectedVoice = fr[0] || voices[0] || null;
-  }
-  playSegments(segments, state.selectedVoice, state.speed, onDone);
 }
 
 function togglePlay() {
@@ -2172,25 +2234,8 @@ function togglePlay() {
     highlightCurrent();
     updatePlayerUI();
   }
-  // Ensure a voice is selected before speaking
-  if (!state.selectedVoice && state.voices.length > 0) {
-    const fr = state.voices.filter(v => v.lang.startsWith('fr'));
-    const pool = fr.length > 0 ? fr : state.voices;
-    const viv = pool.find(v => v.name.toLowerCase().includes('denise'));
-    state.selectedVoice = viv || pool[0];
-  }
   state.isPlaying = true;
   updatePlayerUI();
-  // Check if Speech API available
-  if (typeof speechSynthesis === 'undefined') {
-    state.isPlaying = false; updatePlayerUI();
-    showToast('⚠️ Synthèse vocale non disponible dans ce contexte. Ouvrez le fichier via un serveur local (http://localhost).', 'error');
-    return;
-  }
-  console.log('[TTS] togglePlay — voices:', speechSynthesis.getVoices().length, '| paused:', speechSynthesis.paused, '| speaking:', speechSynthesis.speaking);
-  // Call speakCurrent() directly (synchronous) to stay within the user-gesture context
-  // required by Edge/Chrome for speechSynthesis.speak() — setTimeout would break it
-  _startTTSKeepalive();
   try {
     speakCurrent();
   } catch(e) {
@@ -2229,14 +2274,15 @@ async function loadSettings() {
   document.documentElement.setAttribute('data-theme', theme === 'light' ? 'light' : '');
   $('theme-btn').textContent = theme === 'light' ? '🌙' : '☀️';
 
-  const voiceName = await db.getSetting('voiceName');
-  if (voiceName) selectVoiceByName(voiceName);
-
-  const engine = await db.getSetting('ttsEngine');
-  if (engine === 'kokoro') {
-    state.ttsEngine = 'kokoro';
-    $('voice-chip-label').textContent = 'Kokoro IA';
-  }
+  // Voix IA uniquement
+  state.ttsEngine = 'kokoro';
+  const rawVoice = await db.getSetting('kokoroVoice');
+  // Valider : une voix Edge TTS valide contient '-Neural'. 'mms' et autres anciens IDs sont rejetés.
+  const kVoice = (rawVoice && rawVoice.includes('-Neural')) ? rawVoice : 'fr-FR-DeniseNeural';
+  if (kVoice !== rawVoice) await db.setSetting('kokoroVoice', kVoice); // corriger l'IndexedDB
+  state.kokoroVoice = kVoice;
+  const info = AI_VOICES.find(v => v.id === kVoice);
+  $('voice-chip-label').textContent = info ? `${info.flag} ${info.label.split(' — ')[0]}` : kVoice;
 }
 
 function updateToggle(id, on) {
@@ -2412,49 +2458,52 @@ function sanitizeFilename(str) {
 }
 
 // ===================== VOICE PICKER ================
+// Voix Microsoft Neural via Edge TTS (gratuit, nécessite internet)
+const AI_VOICES = [
+  { id: 'fr-FR-DeniseNeural',   flag: '🇫🇷', label: 'Denise — Français ♀',    model: 'fr' },
+  { id: 'fr-FR-HenriNeural',    flag: '🇫🇷', label: 'Henri — Français ♂',     model: 'fr' },
+  { id: 'fr-FR-EloiseNeural',   flag: '🇫🇷', label: 'Éloïse — Français ♀',    model: 'fr' },
+  { id: 'fr-BE-CharlineNeural', flag: '🇧🇪', label: 'Charline — Belge ♀',      model: 'fr' },
+  { id: 'fr-CH-ArianeNeural',   flag: '🇨🇭', label: 'Ariane — Suisse ♀',      model: 'fr' },
+  { id: 'en-US-AriaNeural',     flag: '🇺🇸', label: 'Aria — Anglais US ♀',    model: 'en' },
+  { id: 'en-US-GuyNeural',      flag: '🇺🇸', label: 'Guy — Anglais US ♂',     model: 'en' },
+  { id: 'en-GB-SoniaNeural',    flag: '🇬🇧', label: 'Sonia — Anglais GB ♀',   model: 'en' },
+  { id: 'en-GB-RyanNeural',     flag: '🇬🇧', label: 'Ryan — Anglais GB ♂',    model: 'en' },
+];
+
 function openVoicePicker() {
   const list = $('voice-list');
-  const voices = state.voices.length > 0 ? state.voices : [];
-  const fr = voices.filter(v => v.lang.startsWith('fr'));
-  const other = voices.filter(v => !v.lang.startsWith('fr'));
+  const cur  = state.kokoroVoice || 'mms';
 
-  const kokoroActive = state.ttsEngine === 'kokoro';
-  let html = `<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">🤖 Voix IA — Kokoro (locale, gratuite)</div>
-<div class="context-item voice-pick-item ${kokoroActive ? 'active' : ''}" data-engine="kokoro" style="${kokoroActive ? 'color:var(--primary);font-weight:600' : ''}">
-  ${kokoroActive ? '✓ ' : ''}🇫🇷 Siwis — Français naturel <span style="color:var(--text-muted);font-size:12px">(~300MB, téléchargé une fois)</span>
-</div>
-<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-top:8px">🔊 Voix système (navigateur)</div>`;
+  let frHtml = '<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">🤖 Voix IA — Français</div>';
+  let enHtml = '<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-top:8px">🤖 Voix IA — Anglais (Kokoro)</div>';
 
-  if (fr.length > 0) html += fr.map(v => voiceItem(v)).join('');
-  if (other.length > 0) {
-    html += '<div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-top:8px">Autres voix</div>';
-    html += other.slice(0, 20).map(v => voiceItem(v)).join('');
-  }
-  list.innerHTML = html || '<div style="padding:16px;color:var(--text-muted);font-size:14px">Aucune voix disponible</div>';
-
-  // Kokoro item click
-  list.querySelectorAll('[data-engine="kokoro"]').forEach(el => {
-    el.addEventListener('click', async () => {
-      state.ttsEngine = 'kokoro';
-      db.setSetting('ttsEngine', 'kokoro');
-      closeModal('voice-modal');
-      $('voice-chip-label').textContent = 'Kokoro IA';
-      showToast('🤖 Kokoro sélectionné');
-      if (!window._kokoroTTS && !window._kokoroLoading) window.initKokoro();
-    });
+  AI_VOICES.forEach(v => {
+    const active = cur === v.id;
+    const item = `<div class="context-item voice-pick-item ${active ? 'active' : ''}" data-voice="${v.id}" style="${active ? 'color:var(--primary);font-weight:600' : ''}">
+      ${active ? '✓ ' : ''}${v.flag} ${v.label}
+    </div>`;
+    if (v.model === 'fr') frHtml += item;
+    else enHtml += item;
   });
 
-  // Voix système click
-  list.querySelectorAll('.voice-pick-item:not([data-engine])').forEach(el => {
+  list.innerHTML = frHtml + enHtml;
+
+  list.querySelectorAll('[data-voice]').forEach(el => {
     el.addEventListener('click', () => {
-      state.ttsEngine = 'browser';
-      db.setSetting('ttsEngine', 'browser');
-      selectVoiceByName(el.dataset.name);
-      db.setSetting('voiceName', el.dataset.name);
+      const vid = el.dataset.voice;
+      state.ttsEngine  = 'kokoro';
+      state.kokoroVoice = vid;
+      db.setSetting('ttsEngine',   'kokoro');
+      db.setSetting('kokoroVoice', vid);
+      const info = AI_VOICES.find(v => v.id === vid);
+      $('voice-chip-label').textContent = info ? `${info.flag} ${info.label.split(' — ')[0]}` : vid;
       closeModal('voice-modal');
-      showToast('Voix : ' + el.dataset.name.split(' ')[0]);
+      showToast('🤖 Voix : ' + (info ? info.label : vid));
+      // Edge TTS : aucun téléchargement — la voix est prête immédiatement
     });
   });
+
   openModal('voice-modal');
 }
 
@@ -2828,17 +2877,21 @@ function renderOCRReview() {
     `<span style="color:#FFA000">⚠ ${mid} moyenne(s)</span> &nbsp;`+
     `<span style="color:#FF3C3C">✗ ${poor} faible(s)</span>`;
 
+  const n = _ocrReviewResults.length;
   list.innerHTML = _ocrReviewResults.map((r,i) => `
     <div class="ocr-page-card" id="ocr-card-${i}">
       <div class="ocr-select-col">
         <input type="checkbox" class="ocr-checkbox" id="ocr-chk-${i}" data-idx="${i}">
+        <button class="ocr-move-btn" data-action="up" data-idx="${i}" title="Monter" ${i===0?'disabled':''}>▲</button>
+        <button class="ocr-move-btn" data-action="down" data-idx="${i}" title="Descendre" ${i===n-1?'disabled':''}>▼</button>
+        <button class="ocr-delete-btn" data-action="delete" data-idx="${i}" title="Supprimer cette page">✕</button>
       </div>
       <div class="ocr-thumb-col">
         <img class="ocr-thumb" src="${r.thumbURL}" alt="Page ${i+1}">
         <div class="ocr-conf-badge ${confClass(r.confidence)}">${confLabel(r.confidence)}</div>
       </div>
       <div class="ocr-text-col">
-        <div class="ocr-page-label">Page ${i+1} / ${_ocrReviewResults.length}</div>
+        <div class="ocr-page-label">Page ${i+1} / ${n}</div>
         <textarea class="ocr-text-preview" id="ocr-text-${i}">${escHtml(r.text.trim())}</textarea>
         <button class="ocr-retry-btn" data-idx="${i}" id="ocr-retry-${i}">
           🔄 Re-traiter cette page (Google Vision)
@@ -2846,10 +2899,37 @@ function renderOCRReview() {
       </div>
     </div>`).join('');
 
+  // Sync textarea edits back to _ocrReviewResults before re-render actions
+  function _syncTextareas() {
+    list.querySelectorAll('.ocr-text-preview').forEach(ta => {
+      const idx = parseInt(ta.id.replace('ocr-text-',''));
+      if (_ocrReviewResults[idx]) _ocrReviewResults[idx].text = ta.value;
+    });
+  }
+
   // Checkbox → card highlight
   list.querySelectorAll('.ocr-checkbox').forEach(chk => {
     chk.addEventListener('change', () => {
       $('ocr-card-'+chk.dataset.idx).classList.toggle('selected', chk.checked);
+    });
+  });
+
+  // Move up / Move down / Delete
+  list.querySelectorAll('.ocr-move-btn, .ocr-delete-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _syncTextareas();
+      const idx = parseInt(btn.dataset.idx);
+      const action = btn.dataset.action;
+      if (action === 'up' && idx > 0) {
+        [_ocrReviewResults[idx-1], _ocrReviewResults[idx]] = [_ocrReviewResults[idx], _ocrReviewResults[idx-1]];
+      } else if (action === 'down' && idx < _ocrReviewResults.length - 1) {
+        [_ocrReviewResults[idx], _ocrReviewResults[idx+1]] = [_ocrReviewResults[idx+1], _ocrReviewResults[idx]];
+      } else if (action === 'delete') {
+        if (!confirm(`Supprimer la page ${idx+1} ?`)) return;
+        if (_ocrReviewResults[idx].thumbURL) URL.revokeObjectURL(_ocrReviewResults[idx].thumbURL);
+        _ocrReviewResults.splice(idx, 1);
+      }
+      renderOCRReview();
     });
   });
 
@@ -3207,47 +3287,7 @@ init().then(()=>initOCRReview()).catch(console.error);
   </div>
 </div>
 
-<!-- ===== KOKORO TTS — moteur IA local ===== -->
-<script type="module">
-window._kokoroTTS     = null;
-window._kokoroLoading = false;
-
-window.initKokoro = async function() {
-  if (window._kokoroTTS)     return true;
-  if (window._kokoroLoading) return false;
-  window._kokoroLoading = true;
-  showToast('🤖 Téléchargement de Kokoro IA (~300 MB)… Cela prend quelques minutes la première fois.', 'info');
-  try {
-    // Utiliser le build navigateur de kokoro-js (pas le build Node.js qui bloque les modèles distants)
-    const { KokoroTTS } = await import(
-      'https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/dist/kokoro.web.js'
-    );
-    window._kokoroTTS = await KokoroTTS.from_pretrained(
-      'onnx-community/Kokoro-82M-v1.0-ONNX',
-      {
-        dtype: 'q8',
-        device: 'wasm',
-        progress_callback: p => {
-          if (p.status === 'progress') {
-            const pct = Math.round(p.progress || 0);
-            document.title = `Kokoro ${pct}% — AudioBook Creator`;
-          } else if (p.status === 'done') {
-            document.title = 'AudioBook Creator';
-          }
-        }
-      }
-    );
-    window._kokoroLoading = false;
-    showToast('✅ Kokoro IA prêt ! Qualité voix naturelle activée.');
-    return true;
-  } catch(e) {
-    window._kokoroLoading = false;
-    console.error('[Kokoro] init error:', e);
-    showToast('❌ Kokoro indisponible : ' + e.message, 'error');
-    return false;
-  }
-};
-</script>
+<!-- Edge TTS via Electron IPC — Microsoft Neural voices, aucun modèle local -->
 
 </body>
 </html>

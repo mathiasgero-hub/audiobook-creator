@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, shell } = require('electron')
+const { app, BrowserWindow, session, shell, ipcMain } = require('electron')
 const path = require('path')
 const http = require('http')
 const fs   = require('fs')
@@ -50,6 +50,7 @@ function createWindow (port) {
       nodeIntegration:  false,
       contextIsolation: true,
       webSecurity:      true,
+      preload: path.join(__dirname, 'preload.js'),
     },
   })
 
@@ -86,5 +87,29 @@ app.on('second-instance', () => {
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.focus()
+  }
+})
+
+// ===== Edge TTS (Microsoft Neural voices, gratuit, nécessite internet) =====
+const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts')
+
+ipcMain.handle('tts-generate', async (_event, text, voice) => {
+  try {
+    const tts = new MsEdgeTTS()
+    await tts.setMetadata(
+      voice || 'fr-FR-DeniseNeural',
+      OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3
+    )
+    const { audioStream } = tts.toStream(text)
+    const chunks = []
+    await new Promise((resolve, reject) => {
+      audioStream.on('data',  c => chunks.push(c))
+      audioStream.on('end',   resolve)
+      audioStream.on('error', reject)
+    })
+    return { mp3b64: Buffer.concat(chunks).toString('base64') }
+  } catch (e) {
+    console.error('[EdgeTTS]', e.message)
+    return { error: e.message }
   }
 })
