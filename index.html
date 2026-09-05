@@ -891,13 +891,6 @@
     </div>
 
     <div class="form-group">
-      <label class="form-label">Voix de lecture (français)</label>
-      <select class="form-input" id="voice-select">
-        <option value="">Chargement des voix…</option>
-      </select>
-    </div>
-
-    <div class="form-group">
       <label class="form-label">Vitesse par défaut</label>
       <select class="form-input" id="default-speed-select">
         <option value="0.75">0.75× (lent)</option>
@@ -912,13 +905,6 @@
     <div class="form-group" style="margin-top:4px">
       <label class="form-label">Pauses à la lecture</label>
 
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
-        <span style="font-size:13px;color:var(--text-muted);min-width:180px">Pause aux virgules / ;</span>
-        <input type="range" class="progress-range" id="comma-pause-range"
-          min="0" max="800" step="25" value="250" style="flex:1">
-        <span id="comma-pause-val" style="font-size:13px;min-width:42px;text-align:right;color:var(--primary);font-weight:600">250ms</span>
-      </div>
-
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
         <span style="font-size:13px;color:var(--text-muted);min-width:180px">Pause entre les phrases</span>
         <input type="range" class="progress-range" id="sent-pause-range"
@@ -927,7 +913,7 @@
       </div>
 
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">
-        Valeurs de référence : <strong>250 ms</strong> aux virgules · <strong>500 ms</strong> entre les phrases
+        Valeur de référence : <strong>500 ms</strong> entre les phrases
       </div>
       <button class="btn-secondary" id="reset-pauses-btn"
         style="font-size:12px;padding:5px 12px">↺ Restaurer les valeurs par défaut</button>
@@ -955,9 +941,9 @@
     </div>
 
     <div style="margin-top:20px">
-      <label class="form-label" style="margin-bottom:10px">Export audio (nécessite clé API OpenAI)</label>
+      <label class="form-label" style="margin-bottom:10px">Export audio</label>
       <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">
-        Génère un fichier MP3 du livre ouvert via OpenAI TTS (voix "alloy", qualité naturelle).
+        Génère un fichier MP3 avec la voix et la vitesse actuellement sélectionnées dans le lecteur.
       </div>
       <button class="btn-secondary" id="export-audio-btn-settings">🎵 Exporter le livre en MP3</button>
     </div>
@@ -1034,8 +1020,8 @@
     <button class="export-btn" id="export-mp3-btn">
       <span class="export-icon">🎵</span>
       <div>
-        <div>Exporter en audio MP3 <span style="color:var(--accent)">(API OpenAI)</span></div>
-        <div style="font-size:11px;font-weight:400;color:var(--text-muted)">Requiert une clé API OpenAI — voix naturelle française</div>
+        <div>Exporter en audio MP3</div>
+        <div style="font-size:11px;font-weight:400;color:var(--text-muted)">Même voix et vitesse que la lecture — Microsoft Neural</div>
       </div>
     </button>
     <div style="margin-top:12px;padding:12px;background:var(--surface2);border-radius:var(--radius-sm);font-size:12px;color:var(--text-muted);line-height:1.6">
@@ -1584,31 +1570,16 @@ async function fileToBase64(file) {
   });
 }
 
-// ===================== MP3 EXPORT (OpenAI TTS) =====
-async function exportBookAsMP3(sentences, apiKey, onProgress, speed = 1.0) {
-  const CHUNK = 4000;
-  const chunks = [];
-  let cur = '';
-  sentences.forEach(s => {
-    if ((cur + ' ' + s).length > CHUNK) {
-      if (cur) chunks.push(cur);
-      cur = s;
-    } else {
-      cur = cur ? cur + ' ' + s : s;
-    }
-  });
-  if (cur) chunks.push(cur);
-
+// ===================== MP3 EXPORT (Edge TTS — même voix/vitesse que la lecture) =====
+async function exportBookAsMP3(sentences, _unused, onProgress, speed = 1.0, voice) {
+  if (!window.electronAPI?.ttsGenerate) throw new Error('API TTS non disponible');
   const blobs = [];
-  for (let i = 0; i < chunks.length; i++) {
-    if (onProgress) onProgress(Math.round(i / chunks.length * 100));
-    const res = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({ model: 'tts-1', input: chunks[i], voice: 'nova', speed: Math.min(4.0, Math.max(0.25, speed)) })
-    });
-    if (!res.ok) throw new Error(`Erreur TTS ${res.status}`);
-    blobs.push(await res.blob());
+  for (let i = 0; i < sentences.length; i++) {
+    if (onProgress) onProgress(Math.round(i / sentences.length * 100));
+    const result = await window.electronAPI.ttsGenerate(sentences[i], voice, speed);
+    if (result.error) throw new Error(result.error);
+    const bytes = Uint8Array.from(atob(result.mp3b64), c => c.charCodeAt(0));
+    blobs.push(new Blob([bytes], { type: 'audio/mpeg' }));
   }
   return new Blob(blobs, { type: 'audio/mpeg' });
 }
@@ -2400,17 +2371,16 @@ async function exportAsTXT(book) {
 }
 
 async function exportAsMP3(book) {
-  if (!state.apiKey) {
-    showToast('Clé API OpenAI requise pour l\'export MP3', 'error');
-    openModal('settings-modal');
-    return;
-  }
   closeModal('export-modal');
-  showProgress('Génération audio en cours… (peut prendre plusieurs minutes)', 0);
+  const voice = state.kokoroVoice || 'fr-FR-DeniseNeural';
+  const speed = state.speed || 1.0;
+  const voiceInfo = AI_VOICES.find(v => v.id === voice);
+  const voiceLabel = voiceInfo ? voiceInfo.label : voice;
+  showProgress(`Export audio — ${voiceLabel} · ${speed}×`, 0);
   try {
-    const blob = await exportBookAsMP3(book.sentences, state.apiKey, pct => {
-      showProgress(`Génération audio : ${pct}%`, pct);
-    }, state.speed);
+    const blob = await exportBookAsMP3(book.sentences, null, pct => {
+      showProgress(`Export audio : ${pct}%`, pct);
+    }, speed, voice);
     downloadBlob(blob, sanitizeFilename(book.title) + '.mp3');
     hideProgress();
     showToast('🎵 Export MP3 terminé !');
@@ -2532,18 +2502,6 @@ async function init() {
 
 
 
-  // Voices — guard against speechSynthesis being unavailable (Edge file:// restriction)
-  if (typeof speechSynthesis !== 'undefined') {
-    if (speechSynthesis.onvoiceschanged !== undefined) {
-      speechSynthesis.onvoiceschanged = loadVoices;
-    }
-    loadVoices();
-    setTimeout(loadVoices, 500);
-    setTimeout(loadVoices, 1500);
-  } else {
-    console.warn('[TTS] speechSynthesis non disponible dans ce contexte');
-  }
-
   // ── Library events ──
   $('add-book-btn').addEventListener('click', () => { resetAddForm(); openModal('add-modal'); });
   $('theme-btn').addEventListener('click', async () => {
@@ -2557,7 +2515,6 @@ async function init() {
   $('settings-btn').addEventListener('click', () => {
     $('api-key-input').value = state.apiKey;
     if ($('google-vision-key-settings')) $('google-vision-key-settings').value = state.googleVisionKey;
-    populateVoiceSelects();
     openModal('settings-modal');
   });
 
@@ -2699,10 +2656,6 @@ async function init() {
     state.apiKey = $('api-key-input').value.trim();
     await db.setSetting('apiKey', state.apiKey);
   });
-  $('voice-select').addEventListener('change', async e => {
-    selectVoiceByName(e.target.value);
-    await db.setSetting('voiceName', e.target.value);
-  });
   $('default-speed-select').addEventListener('change', async e => {
     state.speed = parseFloat(e.target.value);
     $('speed-select').value = e.target.value;
@@ -2711,17 +2664,11 @@ async function init() {
 
   // ── Pause sliders ──
   function syncPauseUI() {
-    const cp = state.commaPauseMs, sp = state.sentencePauseMs;
-    $('comma-pause-range').value = cp; $('comma-pause-val').textContent = cp + 'ms';
-    $('sent-pause-range').value  = sp; $('sent-pause-val').textContent  = sp + 'ms';
+    $('sent-pause-range').value = state.sentencePauseMs;
+    $('sent-pause-val').textContent = state.sentencePauseMs + 'ms';
   }
   $('settings-btn').addEventListener('click', syncPauseUI, true); // sync on open
 
-  $('comma-pause-range').addEventListener('input', async e => {
-    state.commaPauseMs = parseInt(e.target.value);
-    $('comma-pause-val').textContent = state.commaPauseMs + 'ms';
-    await db.setSetting('commaPauseMs', String(state.commaPauseMs));
-  });
   $('sent-pause-range').addEventListener('input', async e => {
     state.sentencePauseMs = parseInt(e.target.value);
     $('sent-pause-val').textContent = state.sentencePauseMs + 'ms';
@@ -2730,12 +2677,10 @@ async function init() {
 
 
   $('reset-pauses-btn').addEventListener('click', async () => {
-    state.commaPauseMs = 250; state.sentencePauseMs = 500;
-    $('comma-pause-range').value = 250; $('comma-pause-val').textContent = '250ms';
-    $('sent-pause-range').value  = 500; $('sent-pause-val').textContent  = '500ms';
-    await db.setSetting('commaPauseMs',  '250');
-    await db.setSetting('sentencePauseMs','500');
-    showToast('Pauses réinitialisées aux valeurs par défaut');
+    state.sentencePauseMs = 500;
+    $('sent-pause-range').value = 500; $('sent-pause-val').textContent = '500ms';
+    await db.setSetting('sentencePauseMs', '500');
+    showToast('Pause réinitialisée à 500 ms');
   });
 
   $('font-size-select').addEventListener('change', async e => {
@@ -3173,8 +3118,8 @@ function initOCRReview() {
 // ===================== SETTINGS EXPORT / IMPORT ==================
 
 const SETTINGS_KEYS = [
-  'apiKey','googleVisionKey','voiceName','defaultSpeed',
-  'fontSize','commaPauseMs','sentencePauseMs','repeatPrev','theme'
+  'apiKey','googleVisionKey','defaultSpeed',
+  'fontSize','sentencePauseMs','repeatPrev','theme'
 ];
 
 async function exportSettings() {
@@ -3206,10 +3151,8 @@ async function importSettings(file) {
       if (s[key] !== undefined) { await db.setSetting(key, s[key]); count++; }
     }
     await loadSettings();
-    populateVoiceSelects();
     if (s.apiKey)          $('api-key-input').value = s.apiKey;
     if (s.googleVisionKey) { const el=$('google-vision-key'); if(el) el.value=s.googleVisionKey; }
-    if (s.commaPauseMs)    { $('comma-pause-range').value=s.commaPauseMs; $('comma-pause-val').textContent=s.commaPauseMs+'ms'; }
     if (s.sentencePauseMs) { $('sent-pause-range').value=s.sentencePauseMs; $('sent-pause-val').textContent=s.sentencePauseMs+'ms'; }
     if (s.defaultSpeed)    $('default-speed-select').value=s.defaultSpeed;
     if (s.fontSize)        $('font-size-select').value=s.fontSize;

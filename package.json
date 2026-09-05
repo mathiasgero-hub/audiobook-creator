@@ -24,7 +24,8 @@
     "copyright": "Copyright © 2026 Mathias Gero",
     "files": [
       "index.html",
-      "main.js"
+      "main.js",
+      "preload.js"
     ],
     "directories": {
       "output": "dist"

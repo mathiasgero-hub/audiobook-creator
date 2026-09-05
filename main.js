@@ -93,14 +93,18 @@ app.on('second-instance', () => {
 // ===== Edge TTS (Microsoft Neural voices, gratuit, nécessite internet) =====
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts')
 
-ipcMain.handle('tts-generate', async (_event, text, voice) => {
+ipcMain.handle('tts-generate', async (_event, text, voice, speed) => {
   try {
     const tts = new MsEdgeTTS()
     await tts.setMetadata(
       voice || 'fr-FR-DeniseNeural',
       OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3
     )
-    const { audioStream } = tts.toStream(text)
+    // Convertir vitesse (0.75, 1.0, 1.5…) en pourcentage SSML (+0%, -25%, +50%…)
+    const rate = speed && speed !== 1
+      ? (speed >= 1 ? `+${Math.round((speed - 1) * 100)}%` : `-${Math.round((1 - speed) * 100)}%`)
+      : '+0%'
+    const { audioStream } = tts.toStream(text, { rate })
     const chunks = []
     await new Promise((resolve, reject) => {
       audioStream.on('data',  c => chunks.push(c))
