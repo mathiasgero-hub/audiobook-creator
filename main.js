@@ -32,6 +32,15 @@ function createWindow() {
   })
   session.defaultSession.setPermissionCheckHandler(() => true)
 
+  // Ajoute CORS sur les réponses HuggingFace pour autoriser fetch depuis file://
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    const origin = details.responseHeaders['access-control-allow-origin']
+    if (!origin) {
+      details.responseHeaders['access-control-allow-origin'] = ['*']
+    }
+    callback({ responseHeaders: details.responseHeaders })
+  })
+
   mainWindow.loadFile('index.html')
 
   // Ouvre les liens externes dans le navigateur du système, pas dans l'app
